@@ -6,6 +6,9 @@ from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from .serializers import LoginSerializer, TiendaSerializer
 from .models import Perfil
+from rest_framework import generics
+from .models import Tienda
+from .permisos import EsAdmin
 
 class LoginView(APIView):
     permission_classes = []  # público
@@ -44,3 +47,24 @@ class LogoutView(APIView):
     def post(self, request):
         request.user.auth_token.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class TiendaListView(generics.ListAPIView):
+    permission_classes = [EsAdmin]
+    queryset = Tienda.objects.all().order_by('nombre')
+    serializer_class = TiendaSerializer
+
+
+class TiendaToggleActivaView(APIView):
+    permission_classes = [EsAdmin]
+
+    def patch(self, request, pk):
+        try:
+            tienda = Tienda.objects.get(pk=pk)
+        except Tienda.DoesNotExist:
+            return Response({'error': 'Tienda no encontrada'}, status=status.HTTP_404_NOT_FOUND)
+
+        tienda.activa = not tienda.activa
+        tienda.save()
+
+        return Response(TiendaSerializer(tienda).data)
