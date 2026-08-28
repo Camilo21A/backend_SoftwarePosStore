@@ -143,6 +143,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework.authtoken',
     'autenticacion',
+    'inventario',
 ]
 
 REST_FRAMEWORK = {
