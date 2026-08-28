@@ -1,5 +1,4 @@
-from rest_framework import generics, status
-from rest_framework.response import Response
+from rest_framework import generics
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from .models import Categoria, Producto, EntradaMercancia
@@ -10,7 +9,6 @@ from autenticacion.models import Perfil
 
 
 def get_tienda(request):
-    """Obtiene la tienda asociada al usuario autenticado."""
     perfil = Perfil.objects.filter(usuario=request.user).first()
     return perfil.tienda if perfil else None
 
@@ -45,19 +43,20 @@ class ProductoListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         tienda = get_tienda(self.request)
-        qs     = Producto.objects.filter(id_tienda=tienda, activo=True)
 
-        # Filtros opcionales por query params
-        nombre   = self.request.query_params.get('nombre')
+        # Lee el parámetro activo — por defecto muestra activos
+        activo_param = self.request.query_params.get('activo', 'true')
+        activo = activo_param.lower() == 'true'
+
+        qs = Producto.objects.filter(id_tienda=tienda, activo=activo)
+
+        nombre    = self.request.query_params.get('nombre')
         categoria = self.request.query_params.get('categoria')
-        barras   = self.request.query_params.get('codigo_barras')
+        barras    = self.request.query_params.get('codigo_barras')
 
-        if nombre:
-            qs = qs.filter(nombre__icontains=nombre)
-        if categoria:
-            qs = qs.filter(id_categoria=categoria)
-        if barras:
-            qs = qs.filter(codigo_barras=barras)
+        if nombre:    qs = qs.filter(nombre__icontains=nombre)
+        if categoria: qs = qs.filter(id_categoria=categoria)
+        if barras:    qs = qs.filter(codigo_barras=barras)
 
         return qs
 
@@ -75,7 +74,6 @@ class ProductoDetailView(generics.RetrieveUpdateDestroyAPIView):
         return Producto.objects.filter(id_tienda=tienda)
 
     def perform_destroy(self, instance):
-        # Archivar en vez de eliminar (RF-02)
         instance.activo = False
         instance.save()
 
