@@ -5,4 +5,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),          # ← esta línea faltaba
     path('api/auth/', include('autenticacion.urls')),
     path('api/inventario/', include('inventario.urls')),
+    path('api/ventas/',      include('ventas.urls')),
 ]
