@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import Venta, VentaItem
 from inventario.models import Producto
-
+from django.db import transaction
 
 class VentaItemSerializer(serializers.ModelSerializer):
     producto_nombre = serializers.CharField(
@@ -34,28 +34,60 @@ class VentaSerializer(serializers.ModelSerializer):
         venta      = Venta.objects.create(**validated_data)
 
         total = 0
-        for item in items_data:
-            id_producto = item['id_producto_id']
-            cantidad    = item['cantidad']
-            producto    = Producto.objects.get(pk=id_producto)
+        def create(self, validated_data):
+            items_data = validated_data.pop('items')
+            tienda     = validated_data['id_tienda']
 
-            precio_unitario = producto.precio_venta
-            subtotal        = precio_unitario * cantidad
+            if not items_data:
+                raise serializers.ValidationError(
+                    {'items': 'La venta debe tener al menos un producto.'}
+                )
 
-            VentaItem.objects.create(
-                id_venta        = venta,
-                id_producto_id  = id_producto,
-                cantidad        = cantidad,
-                precio_unitario = precio_unitario,
-                subtotal        = subtotal,
-            )
+            # Si algo falla adentro, no se guarda nada (ni la venta ni el stock)
+            with transaction.atomic():
+                venta = Venta.objects.create(**validated_data)
+                total = 0
 
-            # Descuenta stock automáticamente (RF-03)
-            producto.stock_actual -= cantidad
-            producto.save()
+                for item in items_data:
+                    id_producto = item['id_producto_id']
+                    cantidad    = item['cantidad']
 
-            total += subtotal
+                    if cantidad <= 0:
+                        raise serializers.ValidationError(
+                            {'items': 'La cantidad debe ser mayor a 0.'}
+                        )
 
-        venta.total = total
-        venta.save()
-        return venta
+                    # Solo productos activos de ESTA tienda, bloqueados mientras se vende
+                    try:
+                        producto = Producto.objects.select_for_update().get(
+                            pk=id_producto, id_tienda=tienda, activo=True
+                        )
+                    except Producto.DoesNotExist:
+                        raise serializers.ValidationError(
+                            {'items': f'El producto {id_producto} no existe.'}
+                        )
+
+                    if producto.stock_actual < cantidad:
+                        raise serializers.ValidationError({
+                            'items': f'Stock insuficiente de "{producto.nombre}": '
+                                     f'hay {producto.stock_actual}.'
+                        })
+
+                    subtotal = producto.precio_venta * cantidad
+
+                    VentaItem.objects.create(
+                        id_venta        = venta,
+                        id_producto     = producto,
+                        cantidad        = cantidad,
+                        precio_unitario = producto.precio_venta,
+                        subtotal        = subtotal,
+                    )
+
+                    producto.stock_actual -= cantidad
+                    producto.save()
+                    total += subtotal
+
+                venta.total = total
+                venta.save()
+
+            return venta
