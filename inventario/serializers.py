@@ -1,92 +1,89 @@
-from django.db import models
 from rest_framework import serializers
-from .models import Categoria, Producto, EntradaMercancia, EntradaItem
+from .models import Venta, VentaItem
+from inventario.models import Producto
+from django.db import transaction
 
-
-class CategoriaSerializer(serializers.ModelSerializer):
-    class Meta:
-        model  = Categoria
-        fields = ['id_categoria', 'nombre', 'activo']
-        # id_tienda NO se expone — se asigna en la vista automáticamente
-
-
-class ProductoSerializer(serializers.ModelSerializer):
-    categoria_nombre = serializers.CharField(
-        source='id_categoria.nombre', read_only=True
-    )
-    # Expone el ID numérico, no el objeto completo
-    id_categoria = serializers.IntegerField(
-        source='id_categoria_id', allow_null=True, required=False
-    )
-
-    class Meta:
-        model  = Producto
-        fields = [
-            'id_producto', 'nombre', 'sinonimos', 'codigo_barras',
-            'precio_venta', 'precio_compra', 'stock_actual', 'stock_minimo',
-            'foto_url', 'activo', 'created_at',
-            'id_categoria', 'categoria_nombre',
-        ]
-        read_only_fields = ['created_at']
-
-    def create(self, validated_data):
-        # Convierte id_categoria_id al campo correcto del modelo
-        id_cat = validated_data.pop('id_categoria_id', None)
-        producto = Producto(**validated_data)
-        if id_cat is not None:
-            producto.id_categoria_id = id_cat
-        producto.save()
-        return producto
-
-    def update(self, instance, validated_data):
-        id_cat = validated_data.pop('id_categoria_id', None)
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        if id_cat is not None:
-            instance.id_categoria_id = id_cat
-        instance.save()
-        return instance
-
-
-class EntradaItemSerializer(serializers.ModelSerializer):
+class VentaItemSerializer(serializers.ModelSerializer):
     producto_nombre = serializers.CharField(
         source='id_producto.nombre', read_only=True
     )
-    id_producto = serializers.IntegerField(source='id_producto_id')
+    id_producto     = serializers.IntegerField(source='id_producto_id')
+    precio_unitario = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True
+    )
+    subtotal        = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True
+    )
 
     class Meta:
-        model  = EntradaItem
-        fields = ['id_item', 'id_producto', 'producto_nombre', 'cantidad', 'costo_unit']
+        model  = VentaItem
+        fields = ['id_item', 'id_producto', 'producto_nombre',
+                  'cantidad', 'precio_unitario', 'subtotal']
 
-
-class EntradaMercanciaSerializer(serializers.ModelSerializer):
-    items = EntradaItemSerializer(many=True, source='entradaitem_set')
+class VentaSerializer(serializers.ModelSerializer):
+    items = VentaItemSerializer(many=True)
 
     class Meta:
-        model  = EntradaMercancia
-        fields = ['id_entrada', 'fecha_hora', 'total', 'notas', 'items']
-        read_only_fields = ['fecha_hora']
+        model  = Venta
+        fields = ['id_venta', 'fecha_hora', 'total', 'metodo_pago',
+                  'fue_por_voz', 'estado', 'motivo_anulacion', 'items']
+        read_only_fields = ['fecha_hora', 'estado']
 
     def create(self, validated_data):
-        items_data = validated_data.pop('entradaitem_set')
-        entrada    = EntradaMercancia.objects.create(**validated_data)
+        items_data = validated_data.pop('items')
+        tienda     = validated_data.get('id_tienda') # Usar .get() por seguridad si no está en 'fields'
 
-        for item in items_data:
-            id_producto = item['id_producto_id']
-            cantidad    = item['cantidad']
-            EntradaItem.objects.create(
-                id_entrada=entrada,
-                id_producto_id=id_producto,
-                cantidad=cantidad,
-                costo_unit=item.get('costo_unit'),
-            )
-            # Actualiza stock automáticamente (RF-03)
-            Producto.objects.filter(pk=id_producto).update(
-                stock_actual=models.F('stock_actual') + cantidad
+        if not items_data:
+            raise serializers.ValidationError(
+                {'items': 'La venta debe tener al menos un producto.'}
             )
 
-        entrada.total = sum(
-            (i.get('costo_unit') or 0) * i['cantidad'] for i in items_data
-        )
-        entrada.save()
-        return entrada
+        # Si algo falla adentro, no se guarda nada (ni la venta ni el stock)
+        with transaction.atomic():
+            venta = Venta.objects.create(**validated_data)
+            total = 0
+
+            for item in items_data:
+                id_producto = item['id_producto_id']
+                cantidad    = item['cantidad']
+
+                if cantidad <= 0:
+                    raise serializers.ValidationError(
+                        {'items': 'La cantidad debe ser mayor a 0.'}
+                    )
+
+                # Solo productos activos de ESTA tienda, bloqueados mientras se vende
+                try:
+                    producto = Producto.objects.select_for_update().get(
+                        pk=id_producto, id_tienda=tienda, activo=True
+                    )
+                except Producto.DoesNotExist:
+                    raise serializers.ValidationError(
+                        {'items': f'El producto {id_producto} no existe.'}
+                    )
+
+                if producto.stock_actual < cantidad:
+                    raise serializers.ValidationError({
+                        'items': f'Stock insuficiente de "{producto.nombre}": '
+                                 f'hay {producto.stock_actual}.'
+                    })
+
+                # Corrección del operador matemático
+                subtotal = producto.precio_venta * cantidad
+
+                VentaItem.objects.create(
+                    id_venta        = venta,
+                    id_producto     = producto,
+                    cantidad        = cantidad,
+                    precio_unitario = producto.precio_venta,
+                    subtotal        = subtotal,
+                )
+
+                producto.stock_actual -= cantidad
+                producto.save()
+                total += subtotal
+
+            venta.total = total
+            venta.save()
+
+        return venta
