@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import transaction
 from rest_framework import serializers
 from .models import Categoria, Producto, EntradaMercancia, EntradaItem
 
@@ -53,10 +53,12 @@ class EntradaItemSerializer(serializers.ModelSerializer):
         source='id_producto.nombre', read_only=True
     )
     id_producto = serializers.IntegerField(source='id_producto_id')
+    cantidad    = serializers.IntegerField(min_value=1)
 
     class Meta:
         model  = EntradaItem
-        fields = ['id_item', 'id_producto', 'producto_nombre', 'cantidad', 'costo_unit']
+        fields = ['id_item', 'id_producto', 'producto_nombre',
+                  'cantidad', 'costo_unit']
 
 
 class EntradaMercanciaSerializer(serializers.ModelSerializer):
@@ -65,28 +67,51 @@ class EntradaMercanciaSerializer(serializers.ModelSerializer):
     class Meta:
         model  = EntradaMercancia
         fields = ['id_entrada', 'fecha_hora', 'total', 'notas', 'items']
-        read_only_fields = ['fecha_hora']
+        read_only_fields = ['fecha_hora', 'total']
 
     def create(self, validated_data):
         items_data = validated_data.pop('entradaitem_set')
-        entrada    = EntradaMercancia.objects.create(**validated_data)
+        tienda     = validated_data['id_tienda']
 
-        for item in items_data:
-            id_producto = item['id_producto_id']
-            cantidad    = item['cantidad']
-            EntradaItem.objects.create(
-                id_entrada=entrada,
-                id_producto_id=id_producto,
-                cantidad=cantidad,
-                costo_unit=item.get('costo_unit'),
-            )
-            # Actualiza stock automáticamente (RF-03)
-            Producto.objects.filter(pk=id_producto).update(
-                stock_actual=models.F('stock_actual') + cantidad
+        if not items_data:
+            raise serializers.ValidationError(
+                {'items': 'La entrada debe tener al menos un producto.'}
             )
 
-        entrada.total = sum(
-            (i.get('costo_unit') or 0) * i['cantidad'] for i in items_data
-        )
-        entrada.save()
+        # Todo o nada: si un producto falla, no se guarda nada
+        with transaction.atomic():
+            entrada = EntradaMercancia.objects.create(**validated_data)
+            total = 0
+
+            for item in items_data:
+                try:
+                    producto = Producto.objects.select_for_update().get(
+                        pk=item['id_producto_id'],
+                        id_tienda=tienda,
+                        activo=True,
+                    )
+                except Producto.DoesNotExist:
+                    raise serializers.ValidationError(
+                        {'items': f'El producto {item["id_producto_id"]} no existe.'}
+                    )
+
+                cantidad = item['cantidad']
+                costo = item.get('costo_unit')
+                if costo is None:
+                    costo = producto.precio_compra or 0
+
+                EntradaItem.objects.create(
+                    id_entrada  = entrada,
+                    id_producto = producto,
+                    cantidad    = cantidad,
+                    costo_unit  = costo,
+                )
+
+                producto.stock_actual += cantidad
+                producto.save()
+                total += costo * cantidad
+
+            entrada.total = total
+            entrada.save()
+
         return entrada
